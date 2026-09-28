@@ -44,6 +44,8 @@ Commands:
     destroy [-f]        Remove container, volumes, and image for current project
     aws-creds           Write scoped AWS credentials to Claude-Yolo-Creds/aws/
     refresh-aws-creds   Refresh SSO-backed profiles in Claude-Yolo-Creds/aws/credentials
+    gcp-create-service-account  Create/scope the workspace's GCP service account
+    gcp-creds           Mint a short-lived GCP access token into Claude-Yolo-Creds/gcp/
     help                Show this help message
 
 Examples:
@@ -68,6 +70,8 @@ Examples:
     devc aws-creds --profile myprofile        # Write AWS credentials for container use
     devc refresh-aws-creds                    # Refresh SSO profiles in Claude-Yolo-Creds/aws/credentials
     devc refresh-aws-creds --dry-run          # Show which SSO session each profile maps to
+    devc gcp-create-service-account --host-project my-proj --projects proj-a,proj-b
+    devc gcp-creds                             # Mint/refresh the workspace's GCP access token
 EOF
 }
 
@@ -91,6 +95,33 @@ check_devcontainer_cli() {
   if ! command -v devcontainer &>/dev/null; then
     log_error "devcontainer CLI not found."
     log_info "Install it with: npm install -g @devcontainers/cli"
+    exit 1
+  fi
+}
+
+check_gcloud_cli() {
+  if ! command -v gcloud &>/dev/null; then
+    log_error "gcloud CLI not found."
+    log_info "Install it: https://cloud.google.com/sdk/docs/install"
+    exit 1
+  fi
+}
+
+# Makes sure gcloud actually has a usable, authenticated account — not just a
+# configured [core/account] property, which can be set without valid credentials.
+ensure_gcloud_login() {
+  if gcloud auth print-access-token &>/dev/null; then
+    return 0
+  fi
+
+  log_info "No usable gcloud login found. Running 'gcloud auth login'..."
+  if ! gcloud auth login; then
+    log_error "gcloud auth login failed or was cancelled."
+    exit 1
+  fi
+
+  if ! gcloud auth print-access-token &>/dev/null; then
+    log_error "Still no usable gcloud credentials after 'gcloud auth login'."
     exit 1
   fi
 }
@@ -140,7 +171,8 @@ extract_mounts_to_file() {
         (contains("target=/home/vscode/.gitconfig,") | not) and
         (contains("target=/workspace/.devcontainer,") | not) and
         (contains("target=/home/vscode/.aws,") | not) and
-        (contains("target=/home/vscode/.ssh,") | not)
+        (contains("target=/home/vscode/.ssh,") | not) and
+        (contains("target=/home/vscode/.gcp,") | not)
       )
     ) | if length > 0 then . else empty end
   ' "$devcontainer_json" 2>/dev/null) || true
@@ -285,6 +317,7 @@ cmd_up() {
   # Ensure credential directories exist — required by bind mounts in devcontainer.json
   mkdir -p "$workspace_folder/Claude-Yolo-Creds/aws"
   mkdir -p "$workspace_folder/Claude-Yolo-Creds/ssh"
+  mkdir -p "$workspace_folder/Claude-Yolo-Creds/gcp"
   # Seed default AWS config if missing — the bind mount overlays ~/.aws so the
   # Dockerfile-baked copy is hidden without this.
   if [[ ! -f "$workspace_folder/Claude-Yolo-Creds/aws/config" ]]; then
@@ -310,6 +343,7 @@ cmd_rebuild() {
   # Ensure credential directories exist — required by bind mounts in devcontainer.json
   mkdir -p "$workspace_folder/Claude-Yolo-Creds/aws"
   mkdir -p "$workspace_folder/Claude-Yolo-Creds/ssh"
+  mkdir -p "$workspace_folder/Claude-Yolo-Creds/gcp"
   if [[ ! -f "$workspace_folder/Claude-Yolo-Creds/aws/config" ]]; then
     cp "$SCRIPT_DIR/aws-config/config" "$workspace_folder/Claude-Yolo-Creds/aws/config"
   fi
@@ -804,6 +838,217 @@ cmd_refresh_aws_creds() {
   python3 "$SCRIPT_DIR/refresh-sso-creds.py" "$creds_file" "$@"
 }
 
+cmd_gcp_create_service_account() {
+  local host_project="" projects_csv="" sa_id=""
+  local roles=()
+  local usage="Usage: devc gcp-create-service-account [--host-project PROJECT] --projects PROJECT[,PROJECT...] [--role ROLE]... [--sa-id NAME]"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --host-project)
+        host_project="$2"
+        shift 2
+        ;;
+      --projects)
+        projects_csv="$2"
+        shift 2
+        ;;
+      --role)
+        roles+=("$2")
+        shift 2
+        ;;
+      --sa-id)
+        sa_id="$2"
+        shift 2
+        ;;
+      *)
+        log_error "Unknown option: $1"
+        log_info "$usage"
+        exit 1
+        ;;
+    esac
+  done
+
+  if [[ -z "$projects_csv" ]]; then
+    log_error "$usage"
+    exit 1
+  fi
+
+  [[ ${#roles[@]} -eq 0 ]] && roles=("roles/viewer")
+
+  check_gcloud_cli
+
+  local workspace
+  workspace="$(get_workspace_folder)"
+  local creds_dir="$workspace/Claude-Yolo-Creds"
+  if [[ ! -d "$creds_dir" ]]; then
+    log_error "Claude-Yolo-Creds/ not found in $workspace"
+    log_info "Run 'devc .' first to set up the workspace."
+    exit 1
+  fi
+
+  mkdir -p "$creds_dir/gcp"
+  local manifest="$creds_dir/gcp/manifest.json"
+
+  # A workspace has exactly one service account. On a repeat run, --host-project/--sa-id
+  # default to (and must match) what's already recorded — only --projects/--role are additive.
+  local existing_sa_email="" existing_host_project="" created=""
+  if [[ -f "$manifest" ]]; then
+    existing_sa_email="$(jq -r '.sa_email' "$manifest")"
+    existing_host_project="$(jq -r '.host_project' "$manifest")"
+    created="$(jq -r '.created' "$manifest")"
+  fi
+  [[ -z "$created" ]] && created="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  if [[ -n "$existing_host_project" ]]; then
+    if [[ -n "$host_project" && "$host_project" != "$existing_host_project" ]]; then
+      log_error "This workspace's service account already lives in '$existing_host_project'."
+      log_info "Each workspace has exactly one service account — use a different workspace for a service account in a different host project."
+      exit 1
+    fi
+    host_project="$existing_host_project"
+  elif [[ -z "$host_project" ]]; then
+    log_error "$usage"
+    log_info "--host-project is required the first time you set up this workspace."
+    exit 1
+  fi
+
+  ensure_gcloud_login
+
+  local user_account
+  user_account="$(gcloud config get-value account 2>/dev/null)"
+
+  local sa_email
+  if [[ -n "$existing_sa_email" ]]; then
+    sa_email="$existing_sa_email"
+  else
+    # Derive a valid SA id (6-30 chars, lowercase alphanumeric + hyphen, starts with a letter) from the workspace name
+    if [[ -z "$sa_id" ]]; then
+      local base
+      base="$(basename "$workspace" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')"
+      sa_id="claude-yolo-${base}"
+      sa_id="${sa_id:0:30}"
+      sa_id="${sa_id%-}"
+    fi
+    sa_email="${sa_id}@${host_project}.iam.gserviceaccount.com"
+  fi
+
+  if gcloud iam service-accounts describe "$sa_email" --project "$host_project" &>/dev/null; then
+    log_info "Service account already exists: $sa_email"
+  else
+    log_info "Creating service account $sa_email in $host_project..."
+    gcloud iam service-accounts create "$sa_id" \
+      --project "$host_project" \
+      --display-name "claude-yolo: $(basename "$workspace")"
+  fi
+
+  log_info "Granting $user_account permission to impersonate $sa_email..."
+  gcloud iam service-accounts add-iam-policy-binding "$sa_email" \
+    --project "$host_project" \
+    --member "user:$user_account" \
+    --role "roles/iam.serviceAccountTokenCreator" >/dev/null
+
+  IFS=',' read -ra projects <<<"$projects_csv"
+  for project in "${projects[@]}"; do
+    for role in "${roles[@]}"; do
+      log_info "Granting $role on $project to $sa_email..."
+      gcloud projects add-iam-policy-binding "$project" \
+        --member "serviceAccount:$sa_email" \
+        --role "$role" >/dev/null
+    done
+  done
+
+  # Merge this run's project->roles into whatever's already recorded, rather than overwriting it —
+  # devc gcp-create-service-account is meant to be re-run to add more projects/roles over time.
+  local new_projects existing_projects merged_projects
+  new_projects="$(jq -n \
+    --argjson projects "$(printf '%s\n' "${projects[@]}" | jq -R . | jq -s 'unique')" \
+    --argjson roles "$(printf '%s\n' "${roles[@]}" | jq -R . | jq -s 'unique')" \
+    '[$projects[] | {(.): $roles}] | add')"
+  # Tolerate manifests written by the old pre-merge schema (projects as a flat array
+  # + a separate top-level roles array) by migrating them to {project: [roles]} on read.
+  existing_projects="$([[ -f "$manifest" ]] && jq -c '
+    if (.projects | type) == "object" then .projects
+    elif (.projects | type) == "array" then
+      ([ .projects[] as $p | { ($p): (.roles // ["roles/viewer"]) } ] | add // {})
+    else {}
+    end
+  ' "$manifest" || echo '{}')"
+  merged_projects="$(jq -n --argjson a "$existing_projects" --argjson b "$new_projects" '
+    reduce (($a|keys) + ($b|keys) | unique)[] as $k
+      ({}; . + {($k): ((($a[$k] // []) + ($b[$k] // [])) | unique)})
+  ')"
+
+  jq -n \
+    --arg sa_email "$sa_email" \
+    --arg host_project "$host_project" \
+    --argjson projects "$merged_projects" \
+    --arg created "$created" \
+    --arg updated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{sa_email: $sa_email, host_project: $host_project, projects: $projects, created: $created, updated: $updated}' \
+    >"$manifest"
+  chmod 600 "$manifest"
+
+  log_success "Service account ready: $sa_email"
+  log_info "Full scope: $(jq -r '.projects | to_entries | map("\(.key) [\(.value | join(", "))]") | join("; ")' "$manifest")"
+  log_info "IAM changes can take a few minutes to propagate — if 'devc gcp-creds' fails with PERMISSION_DENIED right away, wait a bit and retry."
+  log_info "Run 'devc gcp-creds' to mint a token. Run 'devc rebuild' if this is the first time GCP credentials were added to this workspace."
+}
+
+cmd_gcp_creds() {
+  local lifetime="3600"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --lifetime)
+        lifetime="$2"
+        shift 2
+        ;;
+      *)
+        log_error "Unknown option: $1"
+        log_info "Usage: devc gcp-creds [--lifetime SECONDS]"
+        exit 1
+        ;;
+    esac
+  done
+
+  check_gcloud_cli
+  ensure_gcloud_login
+
+  local workspace
+  workspace="$(get_workspace_folder)"
+  local creds_dir="$workspace/Claude-Yolo-Creds/gcp"
+  local manifest="$creds_dir/manifest.json"
+
+  if [[ ! -f "$manifest" ]]; then
+    log_error "No GCP service account configured for this workspace."
+    log_info "Run 'devc gcp-create-service-account' first."
+    exit 1
+  fi
+
+  local sa_email projects
+  sa_email="$(jq -r '.sa_email' "$manifest")"
+  projects="$(jq -r '.projects | to_entries | map("\(.key) [\(.value | join(", "))]") | join("; ")' "$manifest")"
+
+  local token
+  if ! token="$(gcloud auth print-access-token --impersonate-service-account="$sa_email" --lifetime="$lifetime" 2>&1)"; then
+    log_error "Failed to mint a token for $sa_email"
+    printf '%s\n' "$token" >&2
+    log_info "If you just ran 'devc gcp-create-service-account', IAM changes can take a few minutes to propagate — wait and retry."
+    log_info "Otherwise, re-run 'devc gcp-create-service-account' to (re-)grant your current account roles/iam.serviceAccountTokenCreator on this service account."
+    exit 1
+  fi
+
+  local tmp
+  tmp="$(mktemp "$creds_dir/.access_token.XXXXXX")"
+  printf '%s' "$token" >"$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$creds_dir/access_token"
+
+  log_success "Minted token for $sa_email (expires in ${lifetime}s)"
+  log_info "Scoped to: $projects"
+}
+
 cmd_dot() {
   local target_dir
   target_dir="$(get_workspace_folder ".")"
@@ -825,13 +1070,14 @@ cmd_dot() {
   # Create credential directories (mounted read-only into the container)
   mkdir -p "$target_dir/Claude-Yolo-Creds/aws"
   mkdir -p "$target_dir/Claude-Yolo-Creds/ssh"
+  mkdir -p "$target_dir/Claude-Yolo-Creds/gcp"
   # Seed default AWS config — the bind mount overlays ~/.aws so the
   # Dockerfile-baked copy is hidden without a host-side file.
   if [[ ! -f "$target_dir/Claude-Yolo-Creds/aws/config" ]]; then
     cp "$SCRIPT_DIR/aws-config/config" "$target_dir/Claude-Yolo-Creds/aws/config"
     log_info "Copied default AWS config to Claude-Yolo-Creds/aws/config"
   fi
-  log_success "Created Claude-Yolo-Creds/ (aws/, ssh/)"
+  log_success "Created Claude-Yolo-Creds/ (aws/, ssh/, gcp/)"
 
   # Belt-and-suspenders: add to local .gitignore in case global gitignore isn't set up
   local gitignore="$target_dir/.gitignore"
@@ -1058,6 +1304,12 @@ main() {
     ;;
   refresh-aws-creds)
     cmd_refresh_aws_creds "$@"
+    ;;
+  gcp-create-service-account)
+    cmd_gcp_create_service_account "$@"
+    ;;
+  gcp-creds)
+    cmd_gcp_creds "$@"
     ;;
   help | --help | -h)
     print_usage

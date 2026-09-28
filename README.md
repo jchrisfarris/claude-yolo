@@ -23,6 +23,7 @@ Together these let developers work autonomously on real infrastructure tasks —
 claude-yolo is designed to be deployed as a standard, organization-approved way to run Claude Code. What you control:
 
 - **The AWS profile** — you decide which credentials `devc aws-creds` writes into the workspace
+- **The GCP service account and its IAM roles** — `devc gcp-create-service-account` scopes Claude to exactly the projects/roles you grant, never your own `gcloud` identity
 - **The default session policy** — you define the starting permissions (default: read-only)
 - **The container image** — all Claude Code runs from the same hardened environment
 - **Network and filesystem constraints** — inherited from the devcontainer spec
@@ -45,6 +46,7 @@ What users control:
   ```
 
 - **For AWS credential injection:** `uv` must be installed on the host (`brew install uv`)
+- **For GCP credential injection:** `gcloud` CLI must be installed on the host — `devc gcp-create-service-account`/`devc gcp-creds` will prompt you through `gcloud auth login` if you're not already authenticated
 
 ## Quick Start
 
@@ -120,6 +122,45 @@ devc refresh-aws-creds --dry-run    # show which SSO session each section maps t
 
 For each section, it matches the account/role to a `[profile ...]` in `~/.aws/config` to find the right SSO session, uses the cached SSO token (running `aws sso login` if it's missing or expired), and rewrites just that section's keys. If no matching profile exists, pass `--sso-session NAME` (or `--start-url URL --sso-region REGION`) to name the SSO session to use for unmapped accounts.
 
+## GCP Credentials
+
+Claude never sees your own `gcloud` identity. Instead, each workspace gets one dedicated service account that you scope to exactly the GCP projects (and roles) you want Claude to touch — `devc gcp-creds` then writes it a short-lived access token, never a refresh token or key.
+
+Why not just bind-mount `~/.config/gcloud`, or use `gcloud auth application-default login --impersonate-service-account`? Both end up putting your own broad credentials in the container: ADC's `impersonated_service_account` file embeds your OAuth refresh token in cleartext right alongside the impersonation pointer, so anything that can read the file can use it to authenticate as *you*, not just the scoped service account.
+
+### One-time setup per workspace
+
+```bash
+devc gcp-create-service-account --host-project my-host-proj --projects proj-a,proj-b --role roles/viewer
+```
+
+If `gcloud` doesn't already have a usable login, this runs `gcloud auth login` for you first (your own login stays on the host — it's never copied into the container). It then creates (or reuses) a service account named after the workspace directory in `--host-project`, grants it the given `--role`(s) — repeatable, default `roles/viewer` — in each of `--projects`, and grants *your* account `roles/iam.serviceAccountTokenCreator` on that service account only (so you can mint tokens for it, and nothing more). It writes `Claude-Yolo-Creds/gcp/manifest.json` recording each project's granted roles.
+
+IAM changes can take a few minutes to propagate. If `devc gcp-creds` fails with `PERMISSION_DENIED` right after setup, wait a bit and retry before assuming something's wrong.
+
+### Adding more projects or roles later
+
+A workspace has exactly one service account, so `--host-project` only needs to be given once — later calls reuse it (and refuse a different value, since moving a workspace's service account to another host project isn't supported):
+
+```bash
+devc gcp-create-service-account --projects proj-a --role roles/storage.admin   # add a role to an existing project
+devc gcp-create-service-account --projects proj-c --role roles/viewer         # grant access to a new project
+```
+
+This is additive — safe to re-run any time. Each project's granted roles accumulate in the manifest (nothing already granted is ever revoked by this command).
+
+Run `devc rebuild` once after the first time you set this up for a workspace, so the container picks up the new bind mount.
+
+### Minting credentials before a session
+
+```bash
+devc gcp-creds
+```
+
+This impersonates the workspace's service account and writes a short-lived OAuth access token (1 hour by default; `--lifetime SECONDS` to change it) to `Claude-Yolo-Creds/gcp/access_token`, which is bind-mounted read-only into the container at `~/.gcp/access_token` and picked up automatically via `CLOUDSDK_AUTH_ACCESS_TOKEN_FILE`. Re-run before it expires — like AWS credentials, it's never refreshed automatically inside the container.
+
+Because the actual security boundary is the IAM roles bound to the service account (not anything client-side), always pass `--project` explicitly on `gcloud`/`gsutil`/`bq` commands inside the container — there's no single "default" project when a service account spans several.
+
 ## CLI Reference
 
 ```
@@ -137,6 +178,8 @@ devc sync [NAME]    Sync Claude Code sessions to host (for /insights)
 devc cp CONT HOST   Copy files from container to host
 devc aws-creds      Write AWS credentials to Claude-Yolo-Creds/aws/
 devc refresh-aws-creds  Refresh SSO-backed profiles in Claude-Yolo-Creds/aws/credentials
+devc gcp-create-service-account  Create/scope this workspace's GCP service account
+devc gcp-creds      Mint a short-lived GCP access token into Claude-Yolo-Creds/gcp/
 devc self-install   Install devc to ~/.local/bin
 devc update         Update devc to latest version
 devc claude         Run claude --dangerously-skip-permissions in container
@@ -198,10 +241,11 @@ This adds a bind mount to `devcontainer.json` and recreates the container. Exist
 |-----------|---------|
 | Base | Ubuntu 24.04, Node.js 22, Python 3.13 + uv, zsh |
 | User | `vscode` (passwordless sudo), working dir `/workspace` |
-| Tools | `rg`, `fd`, `ast-grep`, `tmux`, `fzf`, `delta`, `iptables`, `terraform`, AWS CLI |
+| Tools | `rg`, `fd`, `ast-grep`, `tmux`, `fzf`, `delta`, `iptables`, `terraform`, AWS CLI, gcloud CLI |
 | Persistent volumes | Shell history (`/commandhistory`), Claude config (`~/.claude`), GitHub CLI auth (`~/.config/gh`) |
 | Host mounts | `~/.gitconfig` (read-only), `.devcontainer/` (read-only) |
 | AWS credentials | Not persisted — lost on `devc rebuild` (intentional) |
+| GCP credentials | Not persisted — lost on `devc rebuild` (intentional) |
 
 ## Troubleshooting
 
