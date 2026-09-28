@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Repo Is
 
-claude-yolo — a safe way to let Claude develop and deploy in AWS (and soon GCP). A sandboxed devcontainer for running Claude Code with `bypassPermissions` safely enabled, with scoped IAM credential injection so security teams can deploy this for their users without handing Claude unrestricted cloud access. The repo ships as a template: users clone it to `~/.claude-yolo/` and the `devc` CLI installs the template into target project directories. Built on Trail of Bits' devcontainer foundations; diverged significantly toward cloud deployment use cases.
+claude-yolo — a safe way to let Claude develop and deploy in AWS (and soon GCP). A sandboxed devcontainer for running Claude Code with `bypassPermissions` safely enabled, with AWS/SSH credentials written to a host-side directory that is bind-mounted read-only into the container, so security teams can deploy this for their users without handing Claude unrestricted cloud access. The repo ships as a template: users clone it to `~/.claude-yolo/` and the `devc` CLI installs the template into target project directories. Built on Trail of Bits' devcontainer foundations; diverged significantly toward cloud deployment use cases.
 
 ## Key Files
 
@@ -18,6 +18,8 @@ claude-yolo — a safe way to let Claude develop and deploy in AWS (and soon GCP
 | `statusline.sh` | Two-line Claude Code status bar (model, folder, branch, context %, cost, time) |
 | `commands/` | Slash commands installed to `~/.claude/commands/` on first run |
 | `aws-config/config` | AWS CLI config copied into the container |
+| `aws_creds.py` | `devc aws-creds` — writes one profile's resolved credentials to `Claude-Yolo-Creds/aws/` |
+| `refresh-sso-creds.py` | `devc refresh-aws-creds` — refreshes every `[<accountId>_<RoleName>]` section in `Claude-Yolo-Creds/aws/credentials` from IAM Identity Center (SSO) sessions |
 
 ## Building and Testing
 

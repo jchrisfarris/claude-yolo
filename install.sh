@@ -42,8 +42,8 @@ Commands:
     sync [project] [--trusted]  Sync sessions from devcontainers to host
     cp <cont> <host>    Copy files/directories from container to host
     destroy [-f]        Remove container, volumes, and image for current project
-    aws-creds           Assume ClaudeDevContainer role and inject credentials into container
-    aws-setup-role      Create the ClaudeDevContainer IAM role in the target account
+    aws-creds           Write scoped AWS credentials to Claude-Yolo-Creds/aws/
+    refresh-aws-creds   Refresh SSO-backed profiles in Claude-Yolo-Creds/aws/credentials
     help                Show this help message
 
 Examples:
@@ -65,8 +65,9 @@ Examples:
     devc cp /some/file ./out    # Copy a path from container to host
     devc destroy                # Remove all project Docker resources
     devc destroy -f             # Skip confirmation prompt
-    devc aws-creds --profile myprofile        # Inject scoped AWS credentials
-    devc aws-setup-role --profile myprofile  # Create the ClaudeDevContainer role
+    devc aws-creds --profile myprofile        # Write AWS credentials for container use
+    devc refresh-aws-creds                    # Refresh SSO profiles in Claude-Yolo-Creds/aws/credentials
+    devc refresh-aws-creds --dry-run          # Show which SSO session each profile maps to
 EOF
 }
 
@@ -137,7 +138,9 @@ extract_mounts_to_file() {
         (contains("target=/home/vscode/.claude,") | not) and
         (contains("target=/home/vscode/.config/gh,") | not) and
         (contains("target=/home/vscode/.gitconfig,") | not) and
-        (contains("target=/workspace/.devcontainer,") | not)
+        (contains("target=/workspace/.devcontainer,") | not) and
+        (contains("target=/home/vscode/.aws,") | not) and
+        (contains("target=/home/vscode/.ssh,") | not)
       )
     ) | if length > 0 then . else empty end
   ' "$devcontainer_json" 2>/dev/null) || true
@@ -278,6 +281,16 @@ cmd_up() {
 
   check_devcontainer_cli
   check_no_sys_admin "$workspace_folder"
+
+  # Ensure credential directories exist — required by bind mounts in devcontainer.json
+  mkdir -p "$workspace_folder/Claude-Yolo-Creds/aws"
+  mkdir -p "$workspace_folder/Claude-Yolo-Creds/ssh"
+  # Seed default AWS config if missing — the bind mount overlays ~/.aws so the
+  # Dockerfile-baked copy is hidden without this.
+  if [[ ! -f "$workspace_folder/Claude-Yolo-Creds/aws/config" ]]; then
+    cp "$SCRIPT_DIR/aws-config/config" "$workspace_folder/Claude-Yolo-Creds/aws/config"
+  fi
+
   log_info "Starting devcontainer in $workspace_folder..."
 
   export DEVC_BUILD_TIMESTAMP
@@ -293,6 +306,14 @@ cmd_rebuild() {
 
   check_devcontainer_cli
   check_no_sys_admin "$workspace_folder"
+
+  # Ensure credential directories exist — required by bind mounts in devcontainer.json
+  mkdir -p "$workspace_folder/Claude-Yolo-Creds/aws"
+  mkdir -p "$workspace_folder/Claude-Yolo-Creds/ssh"
+  if [[ ! -f "$workspace_folder/Claude-Yolo-Creds/aws/config" ]]; then
+    cp "$SCRIPT_DIR/aws-config/config" "$workspace_folder/Claude-Yolo-Creds/aws/config"
+  fi
+
   log_info "Rebuilding devcontainer in $workspace_folder..."
 
   export DEVC_BUILD_TIMESTAMP
@@ -688,6 +709,24 @@ cmd_self_install() {
     log_info "Add this to your shell profile:"
     echo "    export PATH=\"\$HOME/.local/bin:\$PATH\""
   fi
+
+  # Add Claude-Yolo-Creds/ to the global gitignore (append-only, never overwrite)
+  local global_gitignore
+  global_gitignore=$(git config --global core.excludesfile 2>/dev/null || true)
+  # Expand ~ if present
+  global_gitignore="${global_gitignore/#\~/$HOME}"
+  if [[ -z "$global_gitignore" ]]; then
+    global_gitignore="$HOME/.gitignore_global"
+    git config --global core.excludesfile "$global_gitignore"
+    log_info "Set git core.excludesfile to $global_gitignore"
+  fi
+  touch "$global_gitignore"
+  if ! grep -qxF "Claude-Yolo-Creds/" "$global_gitignore" 2>/dev/null; then
+    echo "Claude-Yolo-Creds/" >> "$global_gitignore"
+    log_success "Added Claude-Yolo-Creds/ to global gitignore ($global_gitignore)"
+  else
+    log_info "Claude-Yolo-Creds/ already in global gitignore"
+  fi
 }
 
 cmd_update() {
@@ -718,7 +757,6 @@ cmd_update() {
 
 cmd_aws_creds() {
   local profile=""
-  local role_name=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -726,68 +764,82 @@ cmd_aws_creds() {
         profile="$2"
         shift 2
         ;;
-      --role-name)
-        role_name="$2"
-        shift 2
-        ;;
       *)
         log_error "Unknown option: $1"
-        log_info "Usage: devc aws-creds --profile PROFILE [--role-name NAME]"
+        log_info "Usage: devc aws-creds --profile PROFILE"
         exit 1
         ;;
     esac
   done
 
   if [[ -z "$profile" ]]; then
-    log_error "Usage: devc aws-creds --profile PROFILE [--role-name NAME]"
+    log_error "Usage: devc aws-creds --profile PROFILE"
     exit 1
   fi
 
   local workspace
   workspace="$(get_workspace_folder)"
 
-  local args=("aws-creds" "--profile" "$profile" "--workspace" "$workspace")
-  [[ -n "$role_name" ]] && args+=("--role-name" "$role_name")
-
-  uv run "$SCRIPT_DIR/aws_creds.py" "${args[@]}"
-}
-
-cmd_aws_setup_role() {
-  local profile=""
-  local role_name=""
-
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --profile)
-        profile="$2"
-        shift 2
-        ;;
-      --role-name)
-        role_name="$2"
-        shift 2
-        ;;
-      *)
-        log_error "Unknown option: $1"
-        log_info "Usage: devc aws-setup-role --profile PROFILE [--role-name NAME]"
-        exit 1
-        ;;
-    esac
-  done
-
-  if [[ -z "$profile" ]]; then
-    log_error "Usage: devc aws-setup-role --profile PROFILE [--role-name NAME]"
+  local creds_dir="$workspace/Claude-Yolo-Creds"
+  if [[ ! -d "$creds_dir" ]]; then
+    log_error "Claude-Yolo-Creds/ not found in $workspace"
+    log_info "Run 'devc .' first to set up the workspace."
     exit 1
   fi
 
-  local args=("aws-setup-role" "--profile" "$profile")
-  [[ -n "$role_name" ]] && args+=("--role-name" "$role_name")
+  uv run "$SCRIPT_DIR/aws_creds.py" --profile "$profile" --creds-dir "$creds_dir"
+}
 
-  uv run "$SCRIPT_DIR/aws_creds.py" "${args[@]}"
+cmd_refresh_aws_creds() {
+  local workspace
+  workspace="$(get_workspace_folder)"
+
+  local creds_file="$workspace/Claude-Yolo-Creds/aws/credentials"
+  if [[ ! -f "$creds_file" ]]; then
+    log_error "No credentials file at Claude-Yolo-Creds/aws/credentials"
+    log_info "It needs [<accountId>_<RoleName>] sections to refresh. Run 'devc .' first if the workspace isn't set up."
+    exit 1
+  fi
+
+  python3 "$SCRIPT_DIR/refresh-sso-creds.py" "$creds_file" "$@"
 }
 
 cmd_dot() {
-  # Install template and start container in one command
+  local target_dir
+  target_dir="$(get_workspace_folder ".")"
+
+  # Warn if running inside a git repo — workspaces normally live outside repos
+  if [[ -d "$target_dir/.git" ]]; then
+    log_warn "This directory is a git repository."
+    log_warn "Workspaces normally live outside a repo. Claude-Yolo-Creds/ will be gitignored, but proceed with caution."
+    read -p "Continue anyway? [y/N] " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+      log_info "Aborted."
+      exit 0
+    fi
+  fi
+
   cmd_template "."
+
+  # Create credential directories (mounted read-only into the container)
+  mkdir -p "$target_dir/Claude-Yolo-Creds/aws"
+  mkdir -p "$target_dir/Claude-Yolo-Creds/ssh"
+  # Seed default AWS config — the bind mount overlays ~/.aws so the
+  # Dockerfile-baked copy is hidden without a host-side file.
+  if [[ ! -f "$target_dir/Claude-Yolo-Creds/aws/config" ]]; then
+    cp "$SCRIPT_DIR/aws-config/config" "$target_dir/Claude-Yolo-Creds/aws/config"
+    log_info "Copied default AWS config to Claude-Yolo-Creds/aws/config"
+  fi
+  log_success "Created Claude-Yolo-Creds/ (aws/, ssh/)"
+
+  # Belt-and-suspenders: add to local .gitignore in case global gitignore isn't set up
+  local gitignore="$target_dir/.gitignore"
+  if ! grep -qxF "Claude-Yolo-Creds/" "$gitignore" 2>/dev/null; then
+    echo "Claude-Yolo-Creds/" >> "$gitignore"
+    log_info "Added Claude-Yolo-Creds/ to .gitignore"
+  fi
+
   cmd_up "."
 }
 
@@ -1004,8 +1056,8 @@ main() {
   aws-creds)
     cmd_aws_creds "$@"
     ;;
-  aws-setup-role)
-    cmd_aws_setup_role "$@"
+  refresh-aws-creds)
+    cmd_refresh_aws_creds "$@"
     ;;
   help | --help | -h)
     print_usage

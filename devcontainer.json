@@ -49,7 +49,9 @@
     "source=${localEnv:HOME}/.gitconfig,target=/home/vscode/.gitconfig,type=bind,readonly",
     "source=${localEnv:HOME}/.claude/skills,target=/home/vscode/.claude/skills,type=bind",
     "source=${localWorkspaceFolder}/.devcontainer,target=/workspace/.devcontainer,type=bind,readonly",
-    "source=${localWorkspaceFolder}/.devcontainer/commands,target=/home/vscode/.claude/commands,type=bind,readonly"
+    "source=${localWorkspaceFolder}/.devcontainer/commands,target=/home/vscode/.claude/commands,type=bind,readonly",
+    "source=${localWorkspaceFolder}/Claude-Yolo-Creds/aws,target=/home/vscode/.aws,type=bind,readonly",
+    "source=${localWorkspaceFolder}/Claude-Yolo-Creds/ssh,target=/home/vscode/.ssh,type=bind,readonly"
   ],
   "containerEnv": {
     "DISABLE_ERROR_REPORTING": "1",

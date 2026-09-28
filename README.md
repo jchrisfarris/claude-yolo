@@ -22,7 +22,7 @@ Together these let developers work autonomously on real infrastructure tasks —
 
 claude-yolo is designed to be deployed as a standard, organization-approved way to run Claude Code. What you control:
 
-- **The base IAM role** (`ClaudeDevContainer`) — you set the ceiling on what Claude can ever request
+- **The AWS profile** — you decide which credentials `devc aws-creds` writes into the workspace
 - **The default session policy** — you define the starting permissions (default: read-only)
 - **The container image** — all Claude Code runs from the same hardened environment
 - **Network and filesystem constraints** — inherited from the devcontainer spec
@@ -84,57 +84,41 @@ If you don't set a token, the interactive login flow works as before.
 
 ## AWS Credentials
 
-Claude starts with read-only AWS access. It can request additional permissions by editing a policy file; you grant them by re-running one command.
-
-### One-time setup per AWS account
-
-```bash
-devc aws-setup-role --profile my-profile
-```
-
-This creates an IAM role called `ClaudeDevContainer` in the account associated with `my-profile`, with `AdministratorAccess` attached. The session policy (below) is what actually constrains Claude — the role's broad permissions are the ceiling, not the floor.
-
-For IAM Identity Center (SSO) users: the role is assumable by any principal in the account, so your SSO role can assume it without per-user trust policy configuration.
-
-### Inject credentials before a session
+`devc aws-creds` writes credentials from your host AWS profile into `Claude-Yolo-Creds/aws/`, which is bind-mounted read-only into the container at `~/.aws/`. Claude can use them but cannot modify them.
 
 ```bash
 devc aws-creds --profile my-profile
 ```
 
-This:
-1. Assumes `ClaudeDevContainer` with a read-only session policy
-2. Injects the temporary credentials into the running container as profile `my-profile`
-3. Writes the active session policy to `/workspace/session-policy.json`
+This resolves credentials from the named profile (SSO, assumed role, or IAM user), writes `credentials` and `config` files into `Claude-Yolo-Creds/aws/`, and prints the account identity so you can confirm you're targeting the right account.
 
-Credentials expire after 6 hours. Re-run the command to refresh.
+Re-run any time to refresh — credentials are never auto-refreshed inside the container.
 
-### How Claude requests more permissions
+### SSO profiles
 
-When Claude hits an `AccessDenied` error, it edits `/workspace/session-policy.json` to add what it needs. For example, to run `terraform apply` it might add:
-
-```json
-{
-  "Effect": "Allow",
-  "Action": ["ec2:*", "s3:*", "iam:PassRole"],
-  "Resource": "*"
-}
+```bash
+aws sso login --profile my-profile   # if token has expired
+devc aws-creds --profile my-profile
 ```
-
-Then it asks you to re-run `devc aws-creds --profile my-profile`. The next session picks up the updated policy. You review the diff before running — that's the approval gate.
-
-The default session policy (read-only) lives in `aws-config/session-policy.json` in this repo and is used on first run. After that, the container's copy is used on re-runs.
 
 ### Multiple AWS accounts
 
-Run `devc aws-creds` multiple times with different profiles — credentials accumulate as named profiles in the container's `~/.aws/credentials`:
+Each `devc aws-creds` call overwrites the credential files. To work with multiple accounts simultaneously, use separate workspace directories with separate `Claude-Yolo-Creds/` trees.
+
+### IAM user profiles
+
+`devc aws-creds` will warn if the profile uses long-lived IAM credentials (no session token). They work, but an IAM role or SSO profile is preferred.
+
+### Refreshing multiple SSO profiles at once
+
+If `Claude-Yolo-Creds/aws/credentials` has `[<accountId>_<RoleName>]` sections (for example, hand-populated to give Claude several accounts/roles at once), `devc refresh-aws-creds` refreshes all of them from your IAM Identity Center (SSO) sessions in one pass, instead of running `devc aws-creds` per profile:
 
 ```bash
-devc aws-creds --profile dev
-devc aws-creds --profile staging
+devc refresh-aws-creds              # refresh every [<accountId>_<RoleName>] section
+devc refresh-aws-creds --dry-run    # show which SSO session each section maps to; changes nothing
 ```
 
-Inside the container, use `AWS_PROFILE=dev` or `--profile dev` to select. Credentials do not survive `devc rebuild` by design.
+For each section, it matches the account/role to a `[profile ...]` in `~/.aws/config` to find the right SSO session, uses the cached SSO token (running `aws sso login` if it's missing or expired), and rewrites just that section's keys. If no matching profile exists, pass `--sso-session NAME` (or `--start-url URL --sso-region REGION`) to name the SSO session to use for unmapped accounts.
 
 ## CLI Reference
 
@@ -151,8 +135,8 @@ devc upgrade        Upgrade Claude Code in the container
 devc mount SRC DST  Add a bind mount (host → container)
 devc sync [NAME]    Sync Claude Code sessions to host (for /insights)
 devc cp CONT HOST   Copy files from container to host
-devc aws-creds      Inject scoped AWS credentials into container
-devc aws-setup-role Create the ClaudeDevContainer IAM role
+devc aws-creds      Write AWS credentials to Claude-Yolo-Creds/aws/
+devc refresh-aws-creds  Refresh SSO-backed profiles in Claude-Yolo-Creds/aws/credentials
 devc self-install   Install devc to ~/.local/bin
 devc update         Update devc to latest version
 devc claude         Run claude --dangerously-skip-permissions in container
