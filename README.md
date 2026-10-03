@@ -24,6 +24,7 @@ claude-yolo is designed to be deployed as a standard, organization-approved way 
 
 - **The AWS profile** — you decide which credentials `devc aws-creds` writes into the workspace
 - **The GCP service account and its IAM roles** — `devc gcp-create-service-account` scopes Claude to exactly the projects/roles you grant, never your own `gcloud` identity
+- **Whether Claude runs against Anthropic or Amazon Bedrock** — `devc claude` vs. `devc claude-bedrock`, with Bedrock inference bounded to a service-only bearer token via `devc bedrock-creds`
 - **The default session policy** — you define the starting permissions (default: read-only)
 - **The container image** — all Claude Code runs from the same hardened environment
 - **Network and filesystem constraints** — inherited from the devcontainer spec
@@ -47,6 +48,7 @@ What users control:
 
 - **For AWS credential injection:** `uv` must be installed on the host (`brew install uv`)
 - **For GCP credential injection:** `gcloud` CLI must be installed on the host — `devc gcp-create-service-account`/`devc gcp-creds` will prompt you through `gcloud auth login` if you're not already authenticated
+- **For Amazon Bedrock inference:** `uv` must be installed on the host (same as AWS credential injection)
 
 ## Quick Start
 
@@ -161,6 +163,59 @@ This impersonates the workspace's service account and writes a short-lived OAuth
 
 Because the actual security boundary is the IAM roles bound to the service account (not anything client-side), always pass `--project` explicitly on `gcloud`/`gsutil`/`bq` commands inside the container — there's no single "default" project when a service account spans several.
 
+## Amazon Bedrock Inference
+
+`devc claude-bedrock` runs Claude Code against Amazon Bedrock instead of the Anthropic API — useful if your organization routes model spend and access through AWS rather than an Anthropic account. It reuses whatever AWS credentials you already have; it doesn't need a new credential mechanism, because Claude Code's own Bedrock support just uses the standard AWS SDK credential chain.
+
+### Minting a Bedrock API key
+
+```bash
+devc bedrock-creds --region us-east-1 --profile my-profile
+```
+
+This mints a *short-term Amazon Bedrock API key* — a bearer token, valid for up to 12 hours (`--lifetime SECONDS` to change it, default 28800 = 8h), signed locally from whichever AWS profile you point it at. Omit `--profile` and it resolves the same way the AWS CLI itself would: `AWS_DEFAULT_PROFILE`, then `AWS_PROFILE`, then the config file's default profile. It's written to `Claude-Yolo-Creds/bedrock/token`, bind-mounted read-only into the container.
+
+This is deliberately not the same credential as `devc aws-creds` writes, even though both can come from the same AWS profile. A Bedrock API key inherits that profile's IAM permissions, but — unlike the raw AWS credentials in `Claude-Yolo-Creds/aws/` — it can *only* ever be replayed against the Bedrock API, never against S3, EC2, or anything else the profile might also be able to touch. If the profile you use here has permissions beyond Bedrock (common, since people reuse a broader role for convenience), this bounds what a compromised container session can actually do with it.
+
+Short-term keys are region-locked to wherever they were generated, so `devc claude-bedrock` reads the region back out of `Claude-Yolo-Creds/bedrock/manifest.json` rather than guessing — the two commands can't disagree about which region to use.
+
+### Running Claude against Bedrock
+
+```bash
+devc claude-bedrock
+devc claude-bedrock --model us.anthropic.claude-sonnet-4-6   # any native Claude Code flag passes through
+```
+
+The token is read from the bind-mounted file *inside* the container's own shell and exported only for that one `claude` process — it's never passed as a `--remote-env` value or a command-line argument, so it never sits in any process's argument list where `ps` could see it.
+
+Re-run `devc bedrock-creds` whenever the key expires — like the other credentials in this repo, nothing here refreshes itself automatically.
+
+### IAM permissions needed
+
+Whatever AWS profile/role you point `devc bedrock-creds` at needs, at minimum:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": [
+      "bedrock:InvokeModel",
+      "bedrock:InvokeModelWithResponseStream",
+      "bedrock:ListInferenceProfiles",
+      "bedrock:GetInferenceProfile"
+    ],
+    "Resource": [
+      "arn:aws:bedrock:*:*:inference-profile/*",
+      "arn:aws:bedrock:*:*:application-inference-profile/*",
+      "arn:aws:bedrock:*:*:foundation-model/*"
+    ]
+  }]
+}
+```
+
+You'll also need to have submitted Bedrock's one-time "use case details" form for the Anthropic models in your AWS account (Bedrock console → Model catalog). See [Claude Code on Amazon Bedrock](https://code.claude.com/docs/en/amazon-bedrock) for the full reference, including model pinning — without pinning a model, `claude-bedrock` defaults to Claude Code's built-in Bedrock default (Opus-tier pricing), which matters a lot if you're deploying this to multiple users.
+
 ## CLI Reference
 
 ```
@@ -180,9 +235,11 @@ devc aws-creds      Write AWS credentials to Claude-Yolo-Creds/aws/
 devc refresh-aws-creds  Refresh SSO-backed profiles in Claude-Yolo-Creds/aws/credentials
 devc gcp-create-service-account  Create/scope this workspace's GCP service account
 devc gcp-creds      Mint a short-lived GCP access token into Claude-Yolo-Creds/gcp/
+devc bedrock-creds  Mint a short-lived Bedrock API key into Claude-Yolo-Creds/bedrock/
 devc self-install   Install devc to ~/.local/bin
 devc update         Update devc to latest version
 devc claude         Run claude --dangerously-skip-permissions in container
+devc claude-bedrock Run claude against Amazon Bedrock instead of the Anthropic API
 ```
 
 > Use `devc destroy` to clean up Docker resources. Removing containers manually (e.g. `docker rm`) leaves orphaned volumes that `devc destroy` won't find.
@@ -246,6 +303,7 @@ This adds a bind mount to `devcontainer.json` and recreates the container. Exist
 | Host mounts | `~/.gitconfig` (read-only), `.devcontainer/` (read-only) |
 | AWS credentials | Not persisted — lost on `devc rebuild` (intentional) |
 | GCP credentials | Not persisted — lost on `devc rebuild` (intentional) |
+| Bedrock credentials | Not persisted — lost on `devc rebuild` (intentional) |
 
 ## Troubleshooting
 

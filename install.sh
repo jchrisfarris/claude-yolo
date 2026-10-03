@@ -29,6 +29,7 @@ Commands:
     .                   Install devcontainer template to current directory and start
     up                  Start the devcontainer in current directory
     claude              Runs claude --dangerously-skip-permissions in the container
+    claude-bedrock      Runs claude against Amazon Bedrock instead of the Anthropic API
     rebuild             Rebuild the devcontainer (preserves auth volumes)
     down                Stop the devcontainer
     list [-a]           List running devcontainers (-a includes stopped)
@@ -46,6 +47,7 @@ Commands:
     refresh-aws-creds   Refresh SSO-backed profiles in Claude-Yolo-Creds/aws/credentials
     gcp-create-service-account  Create/scope the workspace's GCP service account
     gcp-creds           Mint a short-lived GCP access token into Claude-Yolo-Creds/gcp/
+    bedrock-creds       Mint a short-lived Bedrock API key into Claude-Yolo-Creds/bedrock/
     help                Show this help message
 
 Examples:
@@ -72,6 +74,8 @@ Examples:
     devc refresh-aws-creds --dry-run          # Show which SSO session each profile maps to
     devc gcp-create-service-account --host-project my-proj --projects proj-a,proj-b
     devc gcp-creds                             # Mint/refresh the workspace's GCP access token
+    devc bedrock-creds --region us-east-1      # Mint a short-lived Bedrock API key
+    devc claude-bedrock                        # Run claude against Amazon Bedrock
 EOF
 }
 
@@ -172,7 +176,8 @@ extract_mounts_to_file() {
         (contains("target=/workspace/.devcontainer,") | not) and
         (contains("target=/home/vscode/.aws,") | not) and
         (contains("target=/home/vscode/.ssh,") | not) and
-        (contains("target=/home/vscode/.gcp,") | not)
+        (contains("target=/home/vscode/.gcp,") | not) and
+        (contains("target=/home/vscode/.bedrock,") | not)
       )
     ) | if length > 0 then . else empty end
   ' "$devcontainer_json" 2>/dev/null) || true
@@ -318,6 +323,7 @@ cmd_up() {
   mkdir -p "$workspace_folder/Claude-Yolo-Creds/aws"
   mkdir -p "$workspace_folder/Claude-Yolo-Creds/ssh"
   mkdir -p "$workspace_folder/Claude-Yolo-Creds/gcp"
+  mkdir -p "$workspace_folder/Claude-Yolo-Creds/bedrock"
   # Seed default AWS config if missing — the bind mount overlays ~/.aws so the
   # Dockerfile-baked copy is hidden without this.
   if [[ ! -f "$workspace_folder/Claude-Yolo-Creds/aws/config" ]]; then
@@ -344,6 +350,7 @@ cmd_rebuild() {
   mkdir -p "$workspace_folder/Claude-Yolo-Creds/aws"
   mkdir -p "$workspace_folder/Claude-Yolo-Creds/ssh"
   mkdir -p "$workspace_folder/Claude-Yolo-Creds/gcp"
+  mkdir -p "$workspace_folder/Claude-Yolo-Creds/bedrock"
   if [[ ! -f "$workspace_folder/Claude-Yolo-Creds/aws/config" ]]; then
     cp "$SCRIPT_DIR/aws-config/config" "$workspace_folder/Claude-Yolo-Creds/aws/config"
   fi
@@ -1049,6 +1056,78 @@ cmd_gcp_creds() {
   log_info "Scoped to: $projects"
 }
 
+cmd_bedrock_creds() {
+  local region="" profile="" lifetime="28800"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --region)
+        region="$2"
+        shift 2
+        ;;
+      --profile)
+        profile="$2"
+        shift 2
+        ;;
+      --lifetime)
+        lifetime="$2"
+        shift 2
+        ;;
+      *)
+        log_error "Unknown option: $1"
+        log_info "Usage: devc bedrock-creds [--region REGION] [--profile PROFILE] [--lifetime SECONDS]"
+        exit 1
+        ;;
+    esac
+  done
+
+  [[ -z "$region" ]] && region="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}"
+
+  local workspace
+  workspace="$(get_workspace_folder)"
+  local creds_dir="$workspace/Claude-Yolo-Creds"
+  if [[ ! -d "$creds_dir" ]]; then
+    log_error "Claude-Yolo-Creds/ not found in $workspace"
+    log_info "Run 'devc .' first to set up the workspace."
+    exit 1
+  fi
+
+  # Only pass --profile through when explicitly given, so bedrock_creds.py's own default
+  # (None) lets boto3 resolve AWS_DEFAULT_PROFILE/AWS_PROFILE/the config default itself,
+  # instead of us shadowing that chain with a hardcoded "default" here.
+  # (No array here: an empty array expands unsafely under `set -u` on bash 3.2, which is
+  # what /bin/bash still is on macOS.)
+  if [[ -n "$profile" ]]; then
+    uv run "$SCRIPT_DIR/bedrock_creds.py" --region "$region" --profile "$profile" --lifetime "$lifetime" --creds-dir "$creds_dir"
+  else
+    uv run "$SCRIPT_DIR/bedrock_creds.py" --region "$region" --lifetime "$lifetime" --creds-dir "$creds_dir"
+  fi
+}
+
+cmd_claude_bedrock() {
+  local workspace
+  workspace="$(get_workspace_folder)"
+
+  check_devcontainer_cli
+
+  local manifest="$workspace/Claude-Yolo-Creds/bedrock/manifest.json"
+  if [[ ! -f "$manifest" ]]; then
+    log_error "No Bedrock credentials configured for this workspace."
+    log_info "Run 'devc bedrock-creds' first."
+    exit 1
+  fi
+
+  local region
+  region="$(jq -r '.region' "$manifest")"
+
+  # CLAUDE_CODE_USE_BEDROCK and the bearer token are set inside the container's own shell,
+  # not via --remote-env, so the token never appears as a devcontainer-exec argument on the host.
+  # shellcheck disable=SC2016 # intentional: expanded by the container's bash, not this one
+  devcontainer exec --workspace-folder "$workspace" \
+    --remote-env AWS_REGION="$region" \
+    /bin/bash -c 'CLAUDE_CODE_USE_BEDROCK=1 AWS_BEARER_TOKEN_BEDROCK="$(cat "$HOME/.bedrock/token")" exec /home/vscode/.local/bin/claude --dangerously-skip-permissions "$@"' -- "$@"
+}
+
 cmd_dot() {
   local target_dir
   target_dir="$(get_workspace_folder ".")"
@@ -1071,13 +1150,14 @@ cmd_dot() {
   mkdir -p "$target_dir/Claude-Yolo-Creds/aws"
   mkdir -p "$target_dir/Claude-Yolo-Creds/ssh"
   mkdir -p "$target_dir/Claude-Yolo-Creds/gcp"
+  mkdir -p "$target_dir/Claude-Yolo-Creds/bedrock"
   # Seed default AWS config — the bind mount overlays ~/.aws so the
   # Dockerfile-baked copy is hidden without a host-side file.
   if [[ ! -f "$target_dir/Claude-Yolo-Creds/aws/config" ]]; then
     cp "$SCRIPT_DIR/aws-config/config" "$target_dir/Claude-Yolo-Creds/aws/config"
     log_info "Copied default AWS config to Claude-Yolo-Creds/aws/config"
   fi
-  log_success "Created Claude-Yolo-Creds/ (aws/, ssh/, gcp/)"
+  log_success "Created Claude-Yolo-Creds/ (aws/, ssh/, gcp/, bedrock/)"
 
   # Belt-and-suspenders: add to local .gitignore in case global gitignore isn't set up
   local gitignore="$target_dir/.gitignore"
@@ -1221,10 +1301,12 @@ cmd_destroy() {
     docker rm -f "$CONTAINER_ID" >/dev/null 2>&1 || true
   fi
 
-  for vol in "${VOLUMES[@]}"; do
-    log_info "Removing volume: $vol"
-    docker volume rm -f "$vol" >/dev/null 2>&1 || true
-  done
+  if [[ ${#VOLUMES[@]} -gt 0 ]]; then
+    for vol in "${VOLUMES[@]}"; do
+      log_info "Removing volume: $vol"
+      docker volume rm -f "$vol" >/dev/null 2>&1 || true
+    done
+  fi
 
   if [[ -n "$IMAGE" ]]; then
     log_info "Removing image: $IMAGE"
@@ -1255,6 +1337,10 @@ main() {
   claude)
     [[ "${1:-}" == "--" ]] && shift
     cmd_exec "/home/vscode/.local/bin/claude" "--dangerously-skip-permissions" "--remote-control" "$@"
+    ;;
+  claude-bedrock)
+    [[ "${1:-}" == "--" ]] && shift
+    cmd_claude_bedrock "$@"
     ;;
   up)
     cmd_up "$@"
@@ -1310,6 +1396,9 @@ main() {
     ;;
   gcp-creds)
     cmd_gcp_creds "$@"
+    ;;
+  bedrock-creds)
+    cmd_bedrock_creds "$@"
     ;;
   help | --help | -h)
     print_usage

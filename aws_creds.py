@@ -20,7 +20,12 @@ import sys
 from pathlib import Path
 
 import boto3
-from botocore.exceptions import ClientError, NoCredentialsError, ProfileNotFound
+from botocore.exceptions import (
+    BotoCoreError,
+    ClientError,
+    NoCredentialsError,
+    ProfileNotFound,
+)
 
 
 def err(msg: str) -> None:
@@ -46,12 +51,19 @@ def cmd_aws_creds(args: argparse.Namespace) -> None:
             f"No credentials for profile '{args.profile}'.\n"
             f"For SSO profiles, run: aws sso login --profile {args.profile}"
         )
-    except ClientError as e:
+    except (ClientError, BotoCoreError) as e:
         die(f"Credential error: {e}")
 
-    resolved = session.get_credentials().resolve()
-    if resolved is None:
+    credentials = session.get_credentials()
+    if credentials is None:
         die(f"Could not resolve credentials for profile '{args.profile}'")
+
+    try:
+        resolved = credentials.get_frozen_credentials()
+    except (ClientError, BotoCoreError) as e:
+        # Freezing an SSO or assumed-role profile's credentials can itself trigger a
+        # refresh, which fails the same way get_caller_identity above can.
+        die(f"Failed to resolve credentials for profile '{args.profile}': {e}")
 
     region = session.region_name or "us-east-1"
 

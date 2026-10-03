@@ -52,7 +52,8 @@
     "source=${localWorkspaceFolder}/.devcontainer/commands,target=/home/vscode/.claude/commands,type=bind,readonly",
     "source=${localWorkspaceFolder}/Claude-Yolo-Creds/aws,target=/home/vscode/.aws,type=bind,readonly",
     "source=${localWorkspaceFolder}/Claude-Yolo-Creds/ssh,target=/home/vscode/.ssh,type=bind,readonly",
-    "source=${localWorkspaceFolder}/Claude-Yolo-Creds/gcp,target=/home/vscode/.gcp,type=bind,readonly"
+    "source=${localWorkspaceFolder}/Claude-Yolo-Creds/gcp,target=/home/vscode/.gcp,type=bind,readonly",
+    "source=${localWorkspaceFolder}/Claude-Yolo-Creds/bedrock,target=/home/vscode/.bedrock,type=bind,readonly"
   ],
   "containerEnv": {
     "CLOUDSDK_AUTH_ACCESS_TOKEN_FILE": "/home/vscode/.gcp/access_token",
