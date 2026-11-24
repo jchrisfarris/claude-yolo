@@ -8,6 +8,11 @@
 Usage:
   devc grant-aws-creds --profile PROFILE [--as-profile NAME] [--policy FILE]
                        [--duration SECONDS] [--description TEXT] [--once]
+  devc grant-all-aws-creds --sso-session NAME [--policy FILE]
+                       [--duration SECONDS] [--description TEXT] [--once]
+
+grant-all-aws-creds grants every profile in ~/.aws/config whose sso_session is NAME, each under
+its own profile name, running `aws sso login --sso-session NAME` once if the token has expired.
 
 Calls GetScopedCredentials with the given profile's temporary credentials and a scope down
 policy (default: aws-config/session-policy.json — a deny-list of irreversible actions). The
@@ -33,11 +38,13 @@ import datetime
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
 import boto3
+import botocore.session
 from botocore.exceptions import (
     BotoCoreError,
     ClientError,
@@ -292,6 +299,35 @@ def record_grant(aws_dir: Path, target: str, result: dict, entry: dict) -> str:
     return expiration
 
 
+def grant_one(
+    aws_dir: Path, profile: str, target: str, policy_text: str, policy_path: Path,
+    description: str, duration: int | None, once: bool,
+) -> dict:
+    """Scope one profile down and record it under target. Raises GrantError on failure.
+
+    Returns the scoped_credentials() result plus the new "expiration".
+    """
+    existing = load_granted(aws_dir).get(target)
+    if once and isinstance(existing, dict) and not existing.get("once"):
+        raise GrantError(
+            f"'{target}' already holds a standing grant, which --once would replace and refresh-aws-creds would then delete."
+        )
+
+    result = scoped_credentials(profile, policy_text, description, duration)
+
+    entry = {
+        "source_profile": profile,
+        "description": description,
+        "policy_source": str(policy_path),
+        "policy": json.loads(policy_text),
+    }
+    if duration is not None:
+        entry["duration_seconds"] = duration
+    if once:
+        entry["once"] = True
+    return {**result, "expiration": record_grant(aws_dir, target, result, entry)}
+
+
 def cmd_grant_aws_creds(args: argparse.Namespace) -> None:
     policy_path = Path(args.policy)
     policy_text = load_policy(policy_path)
@@ -300,40 +336,23 @@ def cmd_grant_aws_creds(args: argparse.Namespace) -> None:
     aws_dir = Path(args.creds_dir) / "aws"
     # --as-profile names the section; --profile is only the host profile we scope down.
     target = args.as_profile or args.profile
-    existing = load_granted(aws_dir).get(target)
-    if args.once and isinstance(existing, dict) and not existing.get("once"):
-        die(
-            f"'{target}' already holds a standing grant, which --once would replace and refresh-aws-creds would then delete.\n"
-            f"Give the one-time grant its own name, e.g. --as-profile {target}-once"
-        )
-
     # Logged to CloudTrail with the GetScopedCredentials event, so the agent session is
     # distinguishable from the human's own use of the same role session.
     description = args.description if args.description is not None else default_description(Path(args.creds_dir))
 
     try:
-        result = scoped_credentials(args.profile, policy_text, description, args.duration)
+        result = grant_one(aws_dir, args.profile, target, policy_text, policy_path, description, args.duration, args.once)
     except GrantError as e:
+        if args.once and "standing grant" in str(e):
+            die(f"{e}\nGive the one-time grant its own name, e.g. --as-profile {target}-once")
         die(str(e))
-
-    entry = {
-        "source_profile": args.profile,
-        "description": description,
-        "policy_source": str(policy_path),
-        "policy": json.loads(policy_text),
-    }
-    if args.duration is not None:
-        entry["duration_seconds"] = args.duration
-    if args.once:
-        entry["once"] = True
-    expiration = record_grant(aws_dir, target, result, entry)
 
     response = result["response"]
     err(f"Account : {result['identity']['Account']}")
     err(f"Identity: {result['identity']['Arn']}")
     err(f"Region  : {result['region']}")
     err(f"Policy  : {policy_path} ({len(policy_text)}/{MAX_POLICY_CHARS} chars)")
-    err(f"Expires : {expiration}")
+    err(f"Expires : {result['expiration']}")
     if response.get("SessionTokenUtilization") is not None:
         err(f"Token   : {response['SessionTokenUtilization']}% of max session token size")
     err(f"Session : {description}")
@@ -342,12 +361,64 @@ def cmd_grant_aws_creds(args: argparse.Namespace) -> None:
     if args.once:
         err("One-time grant: devc refresh-aws-creds won't renew it, and removes it the next time it runs.")
 
+
+def cmd_grant_all_aws_creds(args: argparse.Namespace) -> None:
+    """Grant every profile in ~/.aws/config whose sso_session is args.sso_session."""
+    config = botocore.session.get_session().full_config  # honors AWS_CONFIG_FILE
+    if args.sso_session not in config.get("sso_sessions", {}):
+        die(f"No [sso-session {args.sso_session}] in your AWS config")
+    profiles = sorted(name for name, p in config["profiles"].items() if p.get("sso_session") == args.sso_session)
+    if not profiles:
+        die(f"No profiles use sso_session = {args.sso_session}")
+
+    policy_path = Path(args.policy)
+    policy_text = load_policy(policy_path)
+    review_policy(policy_text)
+
+    aws_dir = Path(args.creds_dir) / "aws"
+    description = args.description if args.description is not None else default_description(Path(args.creds_dir))
+    err(f"Granting {len(profiles)} profile(s) from SSO session '{args.sso_session}' with {policy_path}")
+
+    logged_in, failed = False, []
+    for profile in profiles:
+        try:
+            try:
+                result = grant_one(aws_dir, profile, profile, policy_text, policy_path, description, args.duration, args.once)
+            except SSOLoginRequired:
+                if logged_in:
+                    raise
+                # One login covers every profile in the session
+                err(f"SSO session '{args.sso_session}' is missing or expired; running `aws sso login --sso-session {args.sso_session}` ...")
+                subprocess.run(["aws", "sso", "login", "--sso-session", args.sso_session], check=True)
+                logged_in = True
+                result = grant_one(aws_dir, profile, profile, policy_text, policy_path, description, args.duration, args.once)
+        except (GrantError, subprocess.CalledProcessError) as e:
+            err(f"FAILED  [{profile}]  {e}")
+            failed.append(profile)
+            continue
+        err(f"ok      [{profile}]  {result['identity']['Arn']}  expires {result['expiration']}")
+
+    if len(failed) < len(profiles):
+        err(f"Session : {description}")
+        err(f"Written : {aws_dir}/")
+        if args.once:
+            err("One-time grants: devc refresh-aws-creds won't renew them, and removes them the next time it runs.")
+    if failed:
+        die(f"{len(failed)} of {len(profiles)} profile(s) failed and were left unchanged: {', '.join(failed)}")
+    err(f"All {len(profiles)} profile(s) are ready inside the container with scoped-down permissions.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="devc grant-aws-creds",
         description="Write scoped-down AWS credentials (sts:GetScopedCredentials) to Claude-Yolo-Creds/aws/",
     )
-    parser.add_argument("--profile", required=True, help="AWS profile to scope down (must yield temporary credentials)")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--profile", help="AWS profile to scope down (must yield temporary credentials)")
+    source.add_argument(
+        "--sso-session",
+        help="Grant every profile whose sso_session is this (devc grant-all-aws-creds), each under its own name",
+    )
     parser.add_argument(
         "--as-profile",
         default=None,
@@ -374,11 +445,16 @@ def main() -> None:
     args = parser.parse_args()
     if args.duration is not None and not 1 <= args.duration <= MAX_DURATION_SECONDS:
         parser.error(f"--duration must be between 1 and {MAX_DURATION_SECONDS}")
+    if args.as_profile is not None and args.sso_session is not None:
+        parser.error("--as-profile can't be used with --sso-session; each profile keeps its own name")
     if args.as_profile is not None and (not args.as_profile.strip() or any(c in args.as_profile for c in "[]\n\r")):
         parser.error("--as-profile must be a non-empty profile name without brackets or newlines")
     if args.description is not None and (problem := description_error(args.description)):
         parser.error(f"--description {problem}")
-    cmd_grant_aws_creds(args)
+    if args.sso_session is not None:
+        cmd_grant_all_aws_creds(args)
+    else:
+        cmd_grant_aws_creds(args)
 
 
 if __name__ == "__main__":

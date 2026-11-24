@@ -145,6 +145,21 @@ It prints the account identity so you can confirm you're targeting the right acc
 - **One-time grants (`--once`):** for a permission needed once or briefly. The `granted-policy.json` entry is flagged `"once": true`. `devc refresh-aws-creds` never renews a one-time grant: on its next run it removes the entry, along with the profile's `credentials` and `config` sections. Combine it with `--as-profile` and a short `--duration`. `--once` refuses to overwrite a standing grant of the same name, because refresh would then delete that standing grant.
 - **Additive:** only the named profile's section in `credentials`, its `region` in `config`, and its entry in `granted-policy.json` are updated. Other profiles are left alone, so you can grant several profiles side by side.
 
+### Granting a whole AWS organization
+
+To give Claude every account and role you can reach through one IAM Identity Center sign-in, grant them all at once:
+
+```bash
+devc grant-all-aws-creds --sso-session my-org
+devc grant-all-aws-creds --sso-session my-org --policy ./suggestedpolicy.json --description "OPS-123" --duration 3600
+```
+
+This grants every `[profile ...]` in your `~/.aws/config` with `sso_session = my-org`, each under its own profile name. It takes the same `--policy`, `--description`, `--duration` and `--once` options as `grant-aws-creds` (not `--as-profile`) and reviews the policy once.
+- **Login:** if the SSO token is missing or expired, it runs `aws sso login --sso-session my-org` once for the whole run.
+- **Failures:** a profile that fails (for example, a role without `sts:GetScopedCredentials`) is reported and left unchanged, the rest carry on, and the command exits with status 1.
+- **Refresh:** each profile is recorded in `granted-policy.json` like any other grant, so `devc refresh-aws-creds` keeps them all current.
+- **With `--once`:** profiles that already hold a standing grant are refused rather than replaced.
+
 ### SSO profiles
 
 ```bash
@@ -282,6 +297,7 @@ devc mount SRC DST  Add a bind mount (host → container)
 devc sync [NAME]    Sync Claude Code sessions to host (for /insights)
 devc cp CONT HOST   Copy files from container to host
 devc grant-aws-creds  Write scoped-down (GetScopedCredentials) AWS credentials to Claude-Yolo-Creds/aws/
+devc grant-all-aws-creds  Grant every profile that uses an SSO session (e.g. a whole AWS organization)
 devc refresh-aws-creds  Re-mint every grant recorded by grant-aws-creds; remove --once grants
 devc gcp-create-service-account  Create/scope this workspace's GCP service account
 devc gcp-creds      Mint a short-lived GCP access token into Claude-Yolo-Creds/gcp/

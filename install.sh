@@ -44,6 +44,7 @@ Commands:
     cp <cont> <host>    Copy files/directories from container to host
     destroy [-f]        Remove container, volumes, and image for current project
     grant-aws-creds     Write scoped-down (GetScopedCredentials) AWS credentials to Claude-Yolo-Creds/aws/
+    grant-all-aws-creds Grant every profile that uses an SSO session (e.g. a whole AWS organization)
     refresh-aws-creds   Re-mint every grant from grant-aws-creds; remove --once grants
     gcp-create-service-account  Create/scope the workspace's GCP service account
     gcp-creds           Mint a short-lived GCP access token into Claude-Yolo-Creds/gcp/
@@ -71,6 +72,7 @@ Examples:
     devc destroy -f             # Skip confirmation prompt
     devc grant-aws-creds --profile myprofile  # Write credentials scoped to the default policy
     devc grant-aws-creds --profile myprofile --as-profile claude --description "ticket OPS-123"
+    devc grant-all-aws-creds --sso-session myorg  # Grant every profile using [sso-session myorg]
     devc refresh-aws-creds                    # Re-mint every grant as it was granted
     devc refresh-aws-creds --dry-run          # Show what would be refreshed or removed
     devc gcp-create-service-account --host-project my-proj --projects proj-a,proj-b
@@ -799,16 +801,19 @@ cmd_update() {
   fi
 }
 
-cmd_grant_aws_creds() {
-  local profile="" policy="$SCRIPT_DIR/aws-config/session-policy.json"
-  local usage="Usage: devc grant-aws-creds --profile PROFILE [--as-profile NAME] [--policy FILE] [--duration SECONDS] [--description TEXT] [--once]\n       (--policy: absolute, ./ or ../ paths are used as given; other names are read from $SCRIPT_DIR/aws-config/)"
+# Shared by grant-aws-creds and grant-all-aws-creds: $1 is the flag naming what to grant
+# (--profile or --sso-session), $2 the usage line, the rest the command's arguments.
+run_grant_aws_creds() {
+  local source_flag="$1" usage="$2"
+  shift 2
+  local source="" policy="$SCRIPT_DIR/aws-config/session-policy.json"
   # Optional flags passed through to grant_aws_creds.py only when given
   local extra=()
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --profile)
-        profile="$2"
+      "$source_flag")
+        source="$2"
         shift 2
         ;;
       --policy)
@@ -831,7 +836,7 @@ cmd_grant_aws_creds() {
     esac
   done
 
-  if [[ -z "$profile" ]]; then
+  if [[ -z "$source" ]]; then
     log_error "$usage"
     exit 1
   fi
@@ -856,7 +861,21 @@ cmd_grant_aws_creds() {
 
   # ${extra[@]+...} rather than "${extra[@]}": an empty array expands unsafely under `set -u`
   # on bash 3.2, which is what /bin/bash still is on macOS.
-  uv run "$SCRIPT_DIR/grant_aws_creds.py" --profile "$profile" --policy "$policy" ${extra[@]+"${extra[@]}"} --creds-dir "$creds_dir"
+  uv run "$SCRIPT_DIR/grant_aws_creds.py" "$source_flag" "$source" --policy "$policy" ${extra[@]+"${extra[@]}"} --creds-dir "$creds_dir"
+}
+
+POLICY_PATH_NOTE="(--policy: absolute, ./ or ../ paths are used as given; other names are read from $SCRIPT_DIR/aws-config/)"
+
+cmd_grant_aws_creds() {
+  run_grant_aws_creds --profile \
+    "Usage: devc grant-aws-creds --profile PROFILE [--as-profile NAME] [--policy FILE] [--duration SECONDS] [--description TEXT] [--once]\n       $POLICY_PATH_NOTE" \
+    "$@"
+}
+
+cmd_grant_all_aws_creds() {
+  run_grant_aws_creds --sso-session \
+    "Usage: devc grant-all-aws-creds --sso-session NAME [--policy FILE] [--duration SECONDS] [--description TEXT] [--once]\n       $POLICY_PATH_NOTE" \
+    "$@"
 }
 
 cmd_refresh_aws_creds() {
@@ -1415,6 +1434,9 @@ main() {
     ;;
   grant-aws-creds)
     cmd_grant_aws_creds "$@"
+    ;;
+  grant-all-aws-creds)
+    cmd_grant_all_aws_creds "$@"
     ;;
   refresh-aws-creds)
     cmd_refresh_aws_creds "$@"
