@@ -43,8 +43,8 @@ Commands:
     sync [project] [--trusted]  Sync sessions from devcontainers to host
     cp <cont> <host>    Copy files/directories from container to host
     destroy [-f]        Remove container, volumes, and image for current project
-    aws-creds           Write scoped AWS credentials to Claude-Yolo-Creds/aws/
-    refresh-aws-creds   Refresh SSO-backed profiles in Claude-Yolo-Creds/aws/credentials
+    grant-aws-creds     Write scoped-down (GetScopedCredentials) AWS credentials to Claude-Yolo-Creds/aws/
+    refresh-aws-creds   Re-mint every grant from grant-aws-creds; remove --once grants
     gcp-create-service-account  Create/scope the workspace's GCP service account
     gcp-creds           Mint a short-lived GCP access token into Claude-Yolo-Creds/gcp/
     bedrock-creds       Mint a short-lived Bedrock API key into Claude-Yolo-Creds/bedrock/
@@ -69,9 +69,10 @@ Examples:
     devc cp /some/file ./out    # Copy a path from container to host
     devc destroy                # Remove all project Docker resources
     devc destroy -f             # Skip confirmation prompt
-    devc aws-creds --profile myprofile        # Write AWS credentials for container use
-    devc refresh-aws-creds                    # Refresh SSO profiles in Claude-Yolo-Creds/aws/credentials
-    devc refresh-aws-creds --dry-run          # Show which SSO session each profile maps to
+    devc grant-aws-creds --profile myprofile  # Write credentials scoped to the default policy
+    devc grant-aws-creds --profile myprofile --as-profile claude --description "ticket OPS-123"
+    devc refresh-aws-creds                    # Re-mint every grant as it was granted
+    devc refresh-aws-creds --dry-run          # Show what would be refreshed or removed
     devc gcp-create-service-account --host-project my-proj --projects proj-a,proj-b
     devc gcp-creds                             # Mint/refresh the workspace's GCP access token
     devc bedrock-creds --region us-east-1      # Mint a short-lived Bedrock API key
@@ -174,6 +175,7 @@ extract_mounts_to_file() {
         (contains("target=/home/vscode/.config/gh,") | not) and
         (contains("target=/home/vscode/.gitconfig,") | not) and
         (contains("target=/workspace/.devcontainer,") | not) and
+        (contains("target=/etc/claude-code/CLAUDE.md,") | not) and
         (contains("target=/home/vscode/.aws,") | not) and
         (contains("target=/home/vscode/.ssh,") | not) and
         (contains("target=/home/vscode/.gcp,") | not) and
@@ -266,6 +268,7 @@ cmd_template() {
   cp "$SCRIPT_DIR/.zshrc" "$devcontainer_dir/"
   cp "$SCRIPT_DIR/statusline.sh" "$devcontainer_dir/"
   cp "$SCRIPT_DIR/mcp.json" "$devcontainer_dir/"
+  cp "$SCRIPT_DIR/managed-CLAUDE.md" "$devcontainer_dir/"
   cp -a "$SCRIPT_DIR/aws-config" "$devcontainer_dir/"
   cp -a "$SCRIPT_DIR/commands" "$devcontainer_dir/"
 
@@ -796,8 +799,11 @@ cmd_update() {
   fi
 }
 
-cmd_aws_creds() {
-  local profile=""
+cmd_grant_aws_creds() {
+  local profile="" policy="$SCRIPT_DIR/aws-config/session-policy.json"
+  local usage="Usage: devc grant-aws-creds --profile PROFILE [--as-profile NAME] [--policy FILE] [--duration SECONDS] [--description TEXT] [--once]\n       (--policy: absolute, ./ or ../ paths are used as given; other names are read from $SCRIPT_DIR/aws-config/)"
+  # Optional flags passed through to grant_aws_creds.py only when given
+  local extra=()
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -805,18 +811,38 @@ cmd_aws_creds() {
         profile="$2"
         shift 2
         ;;
+      --policy)
+        policy="$2"
+        shift 2
+        ;;
+      --as-profile | --duration | --description)
+        extra+=("$1" "$2")
+        shift 2
+        ;;
+      --once)
+        extra+=("$1")
+        shift
+        ;;
       *)
         log_error "Unknown option: $1"
-        log_info "Usage: devc aws-creds --profile PROFILE"
+        log_info "$usage"
         exit 1
         ;;
     esac
   done
 
   if [[ -z "$profile" ]]; then
-    log_error "Usage: devc aws-creds --profile PROFILE"
+    log_error "$usage"
     exit 1
   fi
+
+  # Absolute, ./ and ../ paths are used as given (relative to where devc runs, e.g. a
+  # suggestedpolicy.json Claude wrote to the workspace root); a bare name or other relative
+  # path is looked up next to the default session-policy.json.
+  case "$policy" in
+    /* | ./* | ../*) ;;
+    *) policy="$SCRIPT_DIR/aws-config/$policy" ;;
+  esac
 
   local workspace
   workspace="$(get_workspace_folder)"
@@ -828,21 +854,23 @@ cmd_aws_creds() {
     exit 1
   fi
 
-  uv run "$SCRIPT_DIR/aws_creds.py" --profile "$profile" --creds-dir "$creds_dir"
+  # ${extra[@]+...} rather than "${extra[@]}": an empty array expands unsafely under `set -u`
+  # on bash 3.2, which is what /bin/bash still is on macOS.
+  uv run "$SCRIPT_DIR/grant_aws_creds.py" --profile "$profile" --policy "$policy" ${extra[@]+"${extra[@]}"} --creds-dir "$creds_dir"
 }
 
 cmd_refresh_aws_creds() {
   local workspace
   workspace="$(get_workspace_folder)"
 
-  local creds_file="$workspace/Claude-Yolo-Creds/aws/credentials"
-  if [[ ! -f "$creds_file" ]]; then
-    log_error "No credentials file at Claude-Yolo-Creds/aws/credentials"
-    log_info "It needs [<accountId>_<RoleName>] sections to refresh. Run 'devc .' first if the workspace isn't set up."
+  local creds_dir="$workspace/Claude-Yolo-Creds"
+  if [[ ! -f "$creds_dir/aws/granted-policy.json" ]]; then
+    log_error "No grants recorded at Claude-Yolo-Creds/aws/granted-policy.json"
+    log_info "Grant credentials with 'devc grant-aws-creds' first (and 'devc .' if the workspace isn't set up)."
     exit 1
   fi
 
-  python3 "$SCRIPT_DIR/refresh-sso-creds.py" "$creds_file" "$@"
+  uv run "$SCRIPT_DIR/refresh_aws_creds.py" --creds-dir "$creds_dir" "$@"
 }
 
 cmd_gcp_create_service_account() {
@@ -1385,8 +1413,8 @@ main() {
   template)
     cmd_template "$@"
     ;;
-  aws-creds)
-    cmd_aws_creds "$@"
+  grant-aws-creds)
+    cmd_grant_aws_creds "$@"
     ;;
   refresh-aws-creds)
     cmd_refresh_aws_creds "$@"

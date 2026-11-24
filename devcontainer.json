@@ -50,6 +50,7 @@
     "source=${localEnv:HOME}/.claude/skills,target=/home/vscode/.claude/skills,type=bind",
     "source=${localWorkspaceFolder}/.devcontainer,target=/workspace/.devcontainer,type=bind,readonly",
     "source=${localWorkspaceFolder}/.devcontainer/commands,target=/home/vscode/.claude/commands,type=bind,readonly",
+    "source=${localWorkspaceFolder}/.devcontainer/managed-CLAUDE.md,target=/etc/claude-code/CLAUDE.md,type=bind,readonly",
     "source=${localWorkspaceFolder}/Claude-Yolo-Creds/aws,target=/home/vscode/.aws,type=bind,readonly",
     "source=${localWorkspaceFolder}/Claude-Yolo-Creds/ssh,target=/home/vscode/.ssh,type=bind,readonly",
     "source=${localWorkspaceFolder}/Claude-Yolo-Creds/gcp,target=/home/vscode/.gcp,type=bind,readonly",

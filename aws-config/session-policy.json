@@ -2,20 +2,70 @@
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "ReadOnly",
+      "Sid": "AllowAllExceptIrreversible",
       "Effect": "Allow",
-      "Action": [
-        "*:Describe*",
-        "*:List*",
-        "*:Get*",
-        "*:View*",
-        "*:Lookup*",
-        "*:Search*",
-        "*:Scan*",
-        "*:Query*",
-        "*:Check*",
-        "*:Validate*",
-        "*:Read*"
+      "NotAction": [
+        "s3:Delete*",
+        "s3:PutLifecycleConfiguration",
+        "s3:BypassGovernanceRetention",
+        "s3express:Delete*",
+        "glacier:Delete*",
+
+        "dynamodb:Delete*",
+        "rds:Delete*",
+        "dsql:Delete*",
+        "redshift:Delete*",
+        "redshift-serverless:Delete*",
+        "neptune-graph:Delete*",
+        "elasticache:Delete*",
+        "memorydb:Delete*",
+        "cassandra:Drop*",
+        "timestream:Delete*",
+        "es:Delete*",
+        "es:ESHttpDelete",
+        "aoss:Delete*",
+        "glue:Delete*",
+
+        "ec2:Delete*",
+        "ec2:TerminateInstances",
+        "elasticfilesystem:Delete*",
+        "fsx:Delete*",
+
+        "backup:Delete*",
+        "backup:UpdateRecoveryPointLifecycle",
+
+        "kinesis:Delete*",
+        "kafka:Delete*",
+        "sqs:Delete*",
+        "sqs:PurgeQueue",
+
+        "kms:Delete*",
+        "secretsmanager:Delete*",
+        "ssm:Delete*",
+        "acm-pca:Delete*",
+        "cognito-idp:Delete*",
+        "cognito-identity:Delete*",
+
+        "ecr:Delete*",
+        "ecr:BatchDeleteImage",
+        "codecommit:Delete*",
+        "route53domains:Delete*",
+        "cloudformation:Delete*",
+
+        "logs:Delete*",
+        "logs:PutRetentionPolicy",
+        "cloudtrail:Delete*",
+        "cloudtrail:StopLogging",
+
+        "organizations:CloseAccount",
+        "organizations:RemoveAccountFromOrganization",
+        "organizations:LeaveOrganization",
+        "organizations:DeleteOrganization",
+
+        "sts:AssumeRole*",
+        "iam:CreateAccessKey",
+        "iam:CreateLoginProfile",
+        "iam:UpdateLoginProfile"
       ],
       "Resource": "*"
     }
